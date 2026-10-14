@@ -1,6 +1,6 @@
 import { useState, useEffect } from "react";
 import { db } from "./firebase";
-import { doc, getDoc, setDoc } from "firebase/firestore";
+import { doc, getDoc, onSnapshot, runTransaction } from "firebase/firestore";
 
 const COLORS = {
   bg:"#0B0B0B", surface:"#151515", card:"#1A1A1A", border:"#252525",
@@ -16,15 +16,70 @@ const PAGOS = ["Efectivo","Transferencia"];
 const CAT_GASTOS = ["Insumos","Servicios","Transporte","Art. Limpieza","Otros"];
 const ESTADOS_PEDIDO = ["Pendiente","En producción","Listo para entregar","Entregado"];
 
-// ─── Firebase helpers ───
-async function loadFB(key) {
-  try {
-    const snap = await getDoc(doc(db, "falsonueve", key));
-    return snap.exists() ? snap.data().value : [];
-  } catch { return []; }
+// ─── Firebase: sincronización en tiempo real sin pisar datos ───
+// Cada lista se escucha en vivo (onSnapshot). Al guardar no se reemplaza la lista entera:
+// se calcula qué cambió respecto de lo último que vimos (altas, bajas, ediciones por id)
+// y se aplica dentro de una transacción sobre lo que hay en la nube en ese momento.
+// En stock, los cambios de cantidad se aplican como diferencia (+1 / -2), así dos
+// personas vendiendo a la vez no se pisan.
+const SYNC = { synced:{}, pending:{}, queue:{}, setters:{}, onError:null };
+const ref = key => doc(db, "falsonueve", key);
+const leerValor = snap => (snap.exists() ? (snap.data().value || []) : []);
+
+function mezclar(key, server, base, nuevo) {
+  const id = x => String(x && x.id);
+  const baseMap = new Map(base.map(x=>[id(x),x]));
+  const newIds = new Set(nuevo.map(id));
+  const borrados = new Set(base.map(id).filter(i=>!newIds.has(i)));
+  let result = server.filter(x=>!borrados.has(id(x)));
+  const primeraBase = nuevo.findIndex(x=>baseMap.has(id(x)));
+  const adelante = [], atras = [];
+  nuevo.forEach((item, pos) => {
+    const b = baseMap.get(id(item));
+    if(b && JSON.stringify(b)===JSON.stringify(item)) return;      // sin cambios
+    const si = result.findIndex(x=>id(x)===id(item));
+    if(b) {
+      if(si<0) return;                                               // otro lo borró: se respeta
+      let m = item;
+      if(key==="stock" && b.cantidad!==undefined && item.cantidad!==undefined) {
+        const delta = Number(item.cantidad) - Number(b.cantidad);
+        if(!isNaN(delta)) m = { ...item, cantidad: Math.max(0, Number(result[si].cantidad||0) + delta) };
+      }
+      result[si] = m;
+    } else if(si<0) {
+      (primeraBase>=0 && pos<primeraBase ? adelante : atras).push(item);   // alta nueva
+    }
+  });
+  return [...adelante, ...result, ...atras];
 }
-async function saveFB(key, data) {
-  try { await setDoc(doc(db, "falsonueve", key), { value: data }); } catch(e) { console.error(e); }
+
+function subscribeFB(key, setter, onFirst) {
+  SYNC.setters[key] = setter;
+  let first = true;
+  return onSnapshot(ref(key), snap => {
+    if(!SYNC.pending[key]) { const v = leerValor(snap); SYNC.synced[key] = v; setter(v); }
+    if(first) { first = false; onFirst(); }
+  }, err => { console.error(err); SYNC.onError && SYNC.onError("No se pudo leer la base de datos. Revisá la conexión."); if(first){ first=false; onFirst(); } });
+}
+
+function saveFB(key, nuevo) {
+  const base = SYNC.synced[key] || [];
+  SYNC.synced[key] = nuevo;
+  SYNC.pending[key] = (SYNC.pending[key]||0) + 1;
+  const run = () => runTransaction(db, async tx => {
+    const s = await tx.get(ref(key));
+    tx.set(ref(key), { value: mezclar(key, leerValor(s), base, nuevo) });
+  });
+  SYNC.queue[key] = (SYNC.queue[key] || Promise.resolve())
+    .then(run)
+    .catch(e => { console.error(e); SYNC.onError && SYNC.onError("No se pudo guardar el último cambio. Revisá la conexión y volvé a intentar."); })
+    .finally(async () => {
+      SYNC.pending[key]--;
+      if(!SYNC.pending[key]) {
+        try { const v = leerValor(await getDoc(ref(key))); SYNC.synced[key] = v; SYNC.setters[key] && SYNC.setters[key](v); } catch(e) { console.error(e); }
+      }
+    });
+  return SYNC.queue[key];
 }
 
 const fmt = n => `$${Number(n||0).toLocaleString("es-AR")}`;
@@ -1023,10 +1078,15 @@ export default function App() {
   const [pedidos, setPedidos] = useState([]);
   const [fallados, setFallados] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [errorMsg, setErrorMsg] = useState("");
 
   useEffect(() => {
-    Promise.all([loadFB("stock"),loadFB("ventas"),loadFB("gastos"),loadFB("compras"),loadFB("pedidos"),loadFB("fallados")])
-      .then(([s,v,g,c,p,f])=>{ setStock(s);setVentas(v);setGastos(g);setCompras(c);setPedidos(p);setFallados(f);setLoading(false); });
+    SYNC.onError = setErrorMsg;
+    const pares = [["stock",setStock],["ventas",setVentas],["gastos",setGastos],["compras",setCompras],["pedidos",setPedidos],["fallados",setFallados]];
+    let faltan = pares.length;
+    const listo = () => { faltan--; if(faltan===0) setLoading(false); };
+    const unsubs = pares.map(([k,s])=>subscribeFB(k, s, listo));
+    return () => unsubs.forEach(u=>u());
   }, []);
 
   const tabs = [
@@ -1046,6 +1106,11 @@ export default function App() {
 
   return (
     <div style={{ background:COLORS.bg, minHeight:"100vh", maxWidth:480, margin:"0 auto" }}>
+      {errorMsg && (
+        <div onClick={()=>setErrorMsg("")} style={{ position:"sticky", top:0, zIndex:300, background:COLORS.red, color:COLORS.white, fontSize:12, padding:"10px 16px", cursor:"pointer", fontFamily:"'Montserrat',sans-serif" }}>
+          {errorMsg} <span style={{ opacity:0.8 }}>(tocá para cerrar)</span>
+        </div>
+      )}
       <div style={{ paddingBottom:72 }}>
         {tab==="inicio"  && <Inicio  stock={stock} ventas={ventas} gastos={gastos} compras={compras} pedidos={pedidos} fallados={fallados}/>}
         {tab==="ventas"  && <Ventas  ventas={ventas} setVentas={setVentas} stock={stock} setStock={setStock}/>}
